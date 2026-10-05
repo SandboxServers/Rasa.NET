@@ -1,15 +1,18 @@
-// Splits the test classes in a test assembly across CI shards, one test-host process per shard.
+// Splits the tests in a test assembly into lanes, one test-host process per lane, for CI.
 //
-//   dotnet run .github/scripts/TestShards.cs -- <Rasa.Test.dll> <shard count> <output dir> [timings dir]
+//   dotnet run .github/scripts/TestShards.cs -- <Rasa.Test.dll> <lane count> <output dir> [timings dir]
 //
-// Writes <output dir>/shard-<i>.filter, a `dotnet test --filter` expression for each shard. Classes
-// are found in the compiled assembly (every non-abstract type marked [TestClass]) and dealt out
-// slowest first, each to the shard with the least work so far. A class's work is its total duration
-// in the .trx files under [timings dir] (the results of an earlier run), or, for a class those files
-// don't cover, its number of test cases times the average seconds per case.
+// Writes <output dir>/lane-<i>.filter, a `dotnet test --filter` expression for each lane. Tests are
+// found in the compiled assembly (every [TestMethod] on a non-abstract [TestClass] type) and dealt
+// out slowest first, each to the lane with the least work so far. A test's work is its duration in
+// the .trx files under [timings dir] (the results of an earlier run), or, where those files don't
+// cover it, its number of cases (each [DataRow] is one) times the average seconds per case.
 //
-// Every shard but the last lists its classes; the last runs everything the others don't list. So a
-// class this script fails to find, or one added since, still runs exactly once, in the last shard.
+// Whole classes are the unit, except a class bigger than half a lane's share, which is split into
+// its methods so one slow class doesn't set the run's length. A method's data rows stay together.
+//
+// Every lane but the last lists what it runs; the last runs everything the others don't list. So a
+// test this script fails to find, or one added since, still runs exactly once, in the last lane.
 
 using System.Reflection;
 using System.Reflection.Metadata;
@@ -18,87 +21,102 @@ using System.Xml.Linq;
 
 if (args.Length < 3)
 {
-    Console.Error.WriteLine("usage: TestShards.cs <assembly> <shard count> <output dir> [timings dir]");
+    Console.Error.WriteLine("usage: TestShards.cs <assembly> <lane count> <output dir> [timings dir]");
     return 2;
 }
 
 var assemblyPath = args[0];
-var shardCount = int.Parse(args[1]);
+var laneCount = int.Parse(args[1]);
 var outputDir = args[2];
 string? timingsDir = args.Length > 3 ? args[3] : null;
 
-if (shardCount < 1)
+if (laneCount < 1)
 {
-    Console.Error.WriteLine("shard count must be at least 1");
+    Console.Error.WriteLine("lane count must be at least 1");
     return 2;
 }
 
-var cases = FindTestClasses(assemblyPath);
-if (cases.Count == 0)
+var classes = FindTests(assemblyPath);
+if (classes.Count == 0)
 {
     Console.Error.WriteLine($"no [TestClass] types found in {assemblyPath}");
     return 1;
 }
 
 var timings = ReadTimings(timingsDir);
-var timedCases = cases.Where(c => timings.ContainsKey(c.Key)).Sum(c => c.Value);
-var secondsPerCase = timedCases > 0
-    ? cases.Keys.Where(timings.ContainsKey).Sum(c => timings[c]) / timedCases
-    : 1.0;
-var weights = cases.ToDictionary(c => c.Key,
-    c => timings.TryGetValue(c.Key, out var seconds) ? seconds : c.Value * secondsPerCase);
+var timedClasses = classes.Keys.Where(c => timings.ContainsKey((c, null))).ToList();
+var timedCases = timedClasses.Sum(c => classes[c].Values.Sum());
+var secondsPerCase = timedCases > 0 ? timedClasses.Sum(c => timings[(c, null)]) / timedCases : 1.0;
 
-var shards = Enumerable.Range(0, shardCount).Select(_ => new List<string>()).ToArray();
-var load = new double[shardCount];
-foreach (var name in weights.Keys.OrderByDescending(n => weights[n]).ThenBy(n => n, StringComparer.Ordinal))
+double MethodWeight(string cls, string method) =>
+    timings.TryGetValue((cls, method), out var seconds) ? seconds : classes[cls][method] * secondsPerCase;
+double ClassWeight(string cls) =>
+    timings.TryGetValue((cls, null), out var seconds) ? seconds : classes[cls].Keys.Sum(m => MethodWeight(cls, m));
+
+var total = classes.Keys.Sum(ClassWeight);
+var splitAbove = total / laneCount / 2;
+var units = new List<(string Term, double Weight)>();
+foreach (var cls in classes.Keys)
+{
+    if (ClassWeight(cls) > splitAbove && classes[cls].Count > 1)
+        units.AddRange(classes[cls].Keys.Select(m => ($"FullyQualifiedName={cls}.{m}", MethodWeight(cls, m))));
+    else
+        units.Add(($"ClassName={cls}", ClassWeight(cls)));
+}
+
+var lanes = Enumerable.Range(0, laneCount).Select(_ => new List<string>()).ToArray();
+var load = new double[laneCount];
+foreach (var unit in units.OrderByDescending(u => u.Weight).ThenBy(u => u.Term, StringComparer.Ordinal))
 {
     var target = Array.IndexOf(load, load.Min());
-    shards[target].Add(name);
-    load[target] += weights[name];
+    lanes[target].Add(unit.Term);
+    load[target] += unit.Weight;
 }
 
 Directory.CreateDirectory(outputDir);
-var listed = shards.Take(shardCount - 1).SelectMany(s => s).OrderBy(n => n, StringComparer.Ordinal).ToList();
-for (var i = 0; i < shardCount; i++)
+var listed = lanes.Take(laneCount - 1).SelectMany(l => l).OrderBy(t => t, StringComparer.Ordinal).ToList();
+for (var i = 0; i < laneCount; i++)
 {
     string filter;
-    if (i < shardCount - 1)
-        filter = shards[i].Count > 0
-            ? string.Join("|", shards[i].Select(n => $"ClassName={n}"))
-            : "ClassName=__no_class_in_this_shard__";
+    if (i < laneCount - 1)
+        filter = lanes[i].Count > 0 ? string.Join("|", lanes[i]) : "ClassName=__nothing_in_this_lane__";
     else
         filter = listed.Count > 0
-            ? string.Join("&", listed.Select(n => $"ClassName!={n}"))
+            ? string.Join("&", listed.Select(t => t.Replace("=", "!=")))
             : "FullyQualifiedName!=__run_everything__";
-    File.WriteAllText(Path.Combine(outputDir, $"shard-{i}.filter"), filter);
+    File.WriteAllText(Path.Combine(outputDir, $"lane-{i}.filter"), filter);
 }
 
-var source = timings.Count > 0
-    ? $"durations from {timings.Count} classes in earlier results; {cases.Count - cases.Keys.Count(timings.ContainsKey)} estimated from case counts"
-    : "case counts (no earlier results)";
+var timed = timings.Count > 0;
+string Amount(double work) => timed ? $"{work / 60:0.0} min" : $"{work:0} cases";
 var report = new List<string>
 {
-    $"Sharded {cases.Count} test classes ({cases.Values.Sum()} cases) across {shardCount} shards, weighted by {source}.",
+    $"{classes.Count} test classes, {classes.Values.Sum(m => m.Values.Sum())} cases, in {laneCount} lanes; " +
+    (timed
+        ? $"weighted by earlier durations ({classes.Count - timedClasses.Count} classes estimated from case counts)."
+        : "weighted by case counts (no earlier results)."),
+    $"Total {Amount(total)}, ideal {Amount(total / laneCount)} per lane, largest unit {Amount(units.Max(u => u.Weight))}; " +
+    $"{units.Count(u => u.Term.StartsWith("FullyQualifiedName="))} methods split out of {classes.Keys.Count(c => ClassWeight(c) > splitAbove && classes[c].Count > 1)} classes.",
     "",
-    "| Shard | Classes | Planned work |",
+    "| Lane | Units | Planned |",
     "|---|---|---|",
 };
-for (var i = 0; i < shardCount; i++)
-    report.Add($"| {i} | {shards[i].Count} | {(timings.Count > 0 ? $"{load[i] / 60:0.0} min" : $"{load[i]:0} cases")} |");
+for (var i = 0; i < laneCount; i++)
+    report.Add($"| {i} | {(i < laneCount - 1 ? lanes[i].Count.ToString() : $"rest ({lanes[i].Count})")} | {Amount(load[i])} |");
 foreach (var line in report)
     Console.WriteLine(line);
 var summary = Environment.GetEnvironmentVariable("GITHUB_STEP_SUMMARY");
 if (!string.IsNullOrEmpty(summary))
-    File.AppendAllLines(summary, report.Prepend("### Test shards").Append(""));
+    File.AppendAllLines(summary, report.Prepend("### Test lanes").Append(""));
 return 0;
 
-// Test class full name -> number of test cases, counting each [DataRow] as one case.
-static Dictionary<string, int> FindTestClasses(string path)
+// Test class full name -> test method name -> number of cases (each [DataRow] is one).
+static Dictionary<string, Dictionary<string, int>> FindTests(string path)
 {
     using var stream = File.OpenRead(path);
     using var pe = new PEReader(stream);
     var md = pe.GetMetadataReader();
-    var result = new Dictionary<string, int>(StringComparer.Ordinal);
+    var result = new Dictionary<string, Dictionary<string, int>>(StringComparer.Ordinal);
 
     foreach (var handle in md.TypeDefinitions)
     {
@@ -106,17 +124,19 @@ static Dictionary<string, int> FindTestClasses(string path)
         if ((type.Attributes & TypeAttributes.Abstract) != 0 || !HasAttribute(md, type.GetCustomAttributes(), "TestClassAttribute"))
             continue;
 
-        var count = 0;
+        var methods = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (var methodHandle in type.GetMethods())
         {
-            var attributes = md.GetMethodDefinition(methodHandle).GetCustomAttributes();
+            var method = md.GetMethodDefinition(methodHandle);
+            var attributes = method.GetCustomAttributes();
             if (!HasAttribute(md, attributes, "TestMethodAttribute") && !HasAttribute(md, attributes, "DataTestMethodAttribute"))
                 continue;
-            count += Math.Max(1, attributes.Count(a => AttributeName(md, md.GetCustomAttribute(a)) == "DataRowAttribute"));
+            methods[md.GetString(method.Name)] =
+                Math.Max(1, attributes.Count(a => AttributeName(md, md.GetCustomAttribute(a)) == "DataRowAttribute"));
         }
 
-        if (count > 0)
-            result[FullName(md, type)] = count;
+        if (methods.Count > 0)
+            result[FullName(md, type)] = methods;
     }
 
     return result;
@@ -152,10 +172,11 @@ static string FullName(MetadataReader md, TypeDefinition type)
     return ns.Length > 0 ? ns + "." + name : name;
 }
 
-// Test class full name -> total seconds, from every .trx file under the directory.
-static Dictionary<string, double> ReadTimings(string? dir)
+// (class, method) -> total seconds, and (class, null) -> the class's total, from every .trx file
+// under the directory.
+static Dictionary<(string Class, string? Method), double> ReadTimings(string? dir)
 {
-    var result = new Dictionary<string, double>(StringComparer.Ordinal);
+    var result = new Dictionary<(string, string?), double>();
     if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir))
         return result;
 
@@ -163,15 +184,18 @@ static Dictionary<string, double> ReadTimings(string? dir)
     foreach (var file in Directory.EnumerateFiles(dir, "*.trx", SearchOption.AllDirectories))
     {
         var doc = XDocument.Load(file);
-        var classOf = doc.Descendants(t + "UnitTest").ToDictionary(
+        var testOf = doc.Descendants(t + "UnitTest").ToDictionary(
             u => (string?)u.Attribute("id") ?? "",
-            u => (string?)u.Element(t + "TestMethod")?.Attribute("className"));
+            u => u.Element(t + "TestMethod"));
         foreach (var r in doc.Descendants(t + "UnitTestResult"))
         {
-            if (!classOf.TryGetValue((string?)r.Attribute("testId") ?? "", out var cls) || cls == null)
+            if (!testOf.TryGetValue((string?)r.Attribute("testId") ?? "", out var test)
+                || (string?)test?.Attribute("className") is not { } cls
+                || (string?)test.Attribute("name") is not { } method
+                || !TimeSpan.TryParse((string?)r.Attribute("duration"), out var duration))
                 continue;
-            if (TimeSpan.TryParse((string?)r.Attribute("duration"), out var duration))
-                result[cls] = result.GetValueOrDefault(cls) + duration.TotalSeconds;
+            result[(cls, method)] = result.GetValueOrDefault((cls, method)) + duration.TotalSeconds;
+            result[(cls, null)] = result.GetValueOrDefault((cls, null)) + duration.TotalSeconds;
         }
     }
 
