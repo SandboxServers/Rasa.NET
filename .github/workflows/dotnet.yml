@@ -5,38 +5,189 @@ on:
     branches: [ master, development ]
   pull_request:
 
+permissions:
+  contents: read
+
+# A new push to a PR cancels that PR's older run. Runs on development are never cancelled: a
+# cancelled run saves no NuGet cache and leaves no timings for the next run's shard plan.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # How many test processes the suite is split across (see .github/scripts/TestShards.cs).
+  SHARDS: 6
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
 jobs:
-  build:
-
+  changes:
+    name: detect code changes
     runs-on: ubuntu-24.04
-    # The default is 360 minutes; a healthy run takes a fraction of this.
-    timeout-minutes: 30
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      # A PR that changes only docs skips the build and tests. Anything in doubt (an API error, an
+      # empty list, a PR too large to list) runs everything. The skip is done with job conditions,
+      # not paths-ignore, so the required "tests complete" check still reports.
+      - id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          code=true
+          if [ "$EVENT" = "pull_request" ] \
+            && files="$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[].filename')" \
+            && [ -n "$files" ] && [ "$(echo "$files" | wc -l)" -lt 3000 ]; then
+            if ! echo "$files" | grep -Ev '\.md$|^docs/|^\.github/agents/|^\.claude/' | grep -q .; then
+              code=false
+            fi
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" = false ]; then
+            echo "::notice::Only docs changed; skipping the build and tests."
+          fi
 
+  build:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
     steps:
     - uses: actions/checkout@v7
     - name: Setup .NET
       uses: actions/setup-dotnet@v6
       with:
         global-json-file: global.json
+    # Restored on every run, saved only from development: a PR's cache can only be read by that
+    # PR, and the 10 GB per-repository limit evicts the oldest caches first.
+    - name: Restore NuGet cache
+      id: nuget
+      uses: actions/cache/restore@v6
+      with:
+        path: ~/.nuget/packages
+        key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', 'global.json', '.config/dotnet-tools.json') }}
+        restore-keys: nuget-${{ runner.os }}-
     - name: Restore dependencies
       run: dotnet restore
+    - name: Save NuGet cache
+      if: github.event_name == 'push' && github.ref == 'refs/heads/development' && steps.nuget.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ~/.nuget/packages
+        key: ${{ steps.nuget.outputs.cache-primary-key }}
     - name: Build
       run: dotnet build --no-restore
+    # Shards are balanced on how long each test class took in the last green run on development.
+    # Without one (a first run, expired artifacts) they're balanced on test case counts instead.
+    - name: Fetch earlier test timings
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+      run: |
+        run=$(gh run list -R "$REPO" --workflow dotnet.yml --branch development --event push \
+          --status success --limit 1 --json databaseId --jq '.[0].databaseId' || true)
+        if [ -n "$run" ]; then
+          gh run download "$run" -R "$REPO" --pattern 'test-results-*' --dir timings \
+            || echo "::notice::No timings from run $run; balancing on test counts."
+        fi
+    - name: Plan shards
+      id: plan
+      run: |
+        dotnet run .github/scripts/TestShards.cs -- \
+          src/Rasa.Test/bin/Debug/net10.0/Rasa.Test.dll "$SHARDS" src/Rasa.Test/bin/Debug/net10.0/shards timings
+        echo "shards=$(jq -cn --argjson n "$SHARDS" '[range($n)]')" >> "$GITHUB_OUTPUT"
+    # One archive so file modes survive (upload-artifact doesn't keep them).
+    - name: Package test build
+      run: tar -czf test-build.tgz src/Rasa.Test/bin/Debug/net10.0
+    - uses: actions/upload-artifact@v7
+      with:
+        name: test-build
+        path: test-build.tgz
+        retention-days: 1
+
+  test:
+    name: test (shard ${{ matrix.shard }})
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.build.outputs.shards) }}
+    steps:
+    # The tests read the navmeshes, Dockerfile and some sources from the repository root.
+    - uses: actions/checkout@v7
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v6
+      with:
+        global-json-file: global.json
+    - uses: actions/download-artifact@v8
+      with:
+        name: test-build
+    - run: tar -xzf test-build.tgz
     - name: Test
       # A test host that outgrows the runner's 16 GB makes the VM stop answering and GitHub
       # reports "lost communication" with no log. Capping the GC heap at 12 GB turns that into
       # an OutOfMemoryException with a stack trace instead.
       env:
         DOTNET_GCHeapHardLimit: '0x300000000'
-      run: >
-        dotnet test --no-build --verbosity normal
-        --blame-hang-timeout 10m
-        --logger "trx;LogFileName=results.trx"
-        --results-directory TestResults
+        SHARD: ${{ matrix.shard }}
+      run: |
+        dotnet test src/Rasa.Test/bin/Debug/net10.0/Rasa.Test.dll \
+          --filter "$(cat "src/Rasa.Test/bin/Debug/net10.0/shards/shard-$SHARD.filter")" \
+          --blame-hang-timeout 10m \
+          --logger "trx;LogFileName=results-$SHARD.trx" \
+          --results-directory TestResults
     - name: Upload test results
       if: always()
       uses: actions/upload-artifact@v7
       with:
-        name: test-results
+        name: test-results-${{ matrix.shard }}
         path: TestResults/
         retention-days: 14
+
+  # The one check to require: it passes when every shard passed, or when the PR changed only docs.
+  tests-complete:
+    name: tests complete
+    needs: [ changes, build, test ]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+    - if: needs.changes.outputs.code == 'true'
+      uses: actions/download-artifact@v8
+      with:
+        pattern: test-results-*
+        path: results
+    - env:
+        CODE: ${{ needs.changes.outputs.code }}
+        CHANGES: ${{ needs.changes.result }}
+        BUILD: ${{ needs.build.result }}
+        TEST: ${{ needs.test.result }}
+      run: |
+        if [ "$CHANGES" = success ] && [ "$CODE" = false ]; then
+          echo "Docs-only change; tests skipped."
+          exit 0
+        fi
+        total=0; passed=0; failed=0
+        for trx in $(find results -name '*.trx' 2>/dev/null); do
+          total=$((total + $(grep -o '<UnitTestResult ' "$trx" | wc -l)))
+          passed=$((passed + $(grep -o '<UnitTestResult [^>]*outcome="Passed"' "$trx" | wc -l)))
+          failed=$((failed + $(grep -o '<UnitTestResult [^>]*outcome="Failed"' "$trx" | wc -l)))
+        done
+        echo "Across all shards: $total results, $passed passed, $failed failed." | tee -a "$GITHUB_STEP_SUMMARY"
+        if [ "$BUILD" != success ] || [ "$TEST" != success ]; then
+          echo "::error::build: $BUILD, test shards: $TEST"
+          exit 1
+        fi
