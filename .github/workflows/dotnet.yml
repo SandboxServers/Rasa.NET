@@ -17,8 +17,8 @@ concurrency:
 env:
   # The suite runs in RUNNERS x LANES test processes: LANES processes side by side on each of
   # RUNNERS runners (see .github/scripts/TestShards.cs).
-  RUNNERS: 4
-  LANES: 4
+  RUNNERS: 8
+  LANES: 2
   DOTNET_NOLOGO: true
   DOTNET_CLI_TELEMETRY_OPTOUT: true
 
@@ -154,6 +154,9 @@ jobs:
       run: |
         export DOTNET_GCHeapHardLimit=$(printf '0x%x' $((12 * 1024 * 1024 * 1024 / LANES)))
         bin=src/Rasa.Test/bin/Debug/net10.0
+        # The CLI's first run on a fresh machine takes a named mutex; lanes starting at the same
+        # moment race for it ("NuGet-Migrations ... EEXIST"). One run up front settles it.
+        dotnet test "$bin/Rasa.Test.dll" --list-tests > /dev/null
         pids=()
         for lane in $(seq $((RUNNER * LANES)) $((RUNNER * LANES + LANES - 1))); do
           dotnet test "$bin/Rasa.Test.dll"             --filter "$(cat "$bin/lanes/lane-$lane.filter")"             --blame-hang-timeout 10m             --logger "trx;LogFileName=lane-$lane.trx"             --results-directory "TestResults/lane-$lane" > "lane-$lane.log" 2>&1 &
