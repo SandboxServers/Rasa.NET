@@ -425,3 +425,4 @@ If the server consoles launched correctly, you should be ready to start the game
 - Login with the user you created for the game above
 
 > A first-login server crash is reported in [InfiniteRasa/Rasa.NET#45](https://github.com/InfiniteRasa/Rasa.NET/issues/45). The automated protocol checks do not reproduce the complete native-client first-load sequence. If you encounter it, capture the server error and frame boundaries, restart `Rasa.Game`, and retry without treating the workaround as acceptance. See the [protocol regression guide](protocol-testing.md).
+
