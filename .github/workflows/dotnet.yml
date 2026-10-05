@@ -17,8 +17,8 @@ concurrency:
 env:
   # The suite runs in RUNNERS x LANES test processes: LANES processes side by side on each of
   # RUNNERS runners (see .github/scripts/TestShards.cs).
-  RUNNERS: 6
-  LANES: 3
+  RUNNERS: 8
+  LANES: 2
   DOTNET_NOLOGO: true
   DOTNET_CLI_TELEMETRY_OPTOUT: true
 
@@ -90,9 +90,9 @@ jobs:
         key: ${{ steps.nuget.outputs.cache-primary-key }}
     - name: Build
       run: dotnet build --no-restore
-    # Lanes are balanced on how long each test took in the last green run on development, or, on
-    # a PR, the PR's own last green run. Without either (a first run, expired artifacts) they're
-    # balanced on test case counts instead.
+    # Lanes are balanced on how long each test took in the last 3 green runs on development, or,
+    # on a PR with none there, the PR's own last green runs. Without any (a first run, expired
+    # artifacts) they're balanced on test case counts instead.
     - name: Fetch earlier test timings
       env:
         GH_TOKEN: ${{ github.token }}
@@ -100,16 +100,16 @@ jobs:
         HEAD: ${{ github.head_ref }}
       run: |
         last_green() {
-          gh run list -R "$REPO" --workflow dotnet.yml --status success --limit 1             --json databaseId --jq '.[0].databaseId' "$@" 2>/dev/null || true
+          gh run list -R "$REPO" --workflow dotnet.yml --status success --limit 3             --json databaseId --jq '.[].databaseId' "$@" 2>/dev/null || true
         }
-        run=$(last_green --branch development --event push)
-        if [ -z "$run" ] && [ -n "$HEAD" ]; then
-          run=$(last_green --branch "$HEAD")
+        runs=$(last_green --branch development --event push)
+        if [ -z "$runs" ] && [ -n "$HEAD" ]; then
+          runs=$(last_green --branch "$HEAD")
         fi
-        if [ -n "$run" ]; then
+        for run in $runs; do
           echo "Timings from run $run."
-          gh run download "$run" -R "$REPO" --pattern 'test-results-*' --dir timings             || echo "::notice::No timings from run $run; balancing on test counts."
-        fi
+          gh run download "$run" -R "$REPO" --pattern 'test-results-*' --dir "timings/$run"             || echo "::notice::No timings from run $run."
+        done
     - name: Plan test lanes
       id: plan
       run: |

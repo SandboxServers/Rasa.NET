@@ -5,8 +5,9 @@
 // Writes <output dir>/lane-<i>.filter, a `dotnet test --filter` expression for each lane. Tests are
 // found in the compiled assembly (every [TestMethod] on a non-abstract [TestClass] type) and dealt
 // out slowest first, each to the lane with the least work so far. A test's work is its duration in
-// the .trx files under [timings dir] (the results of an earlier run), or, where those files don't
-// cover it, its number of cases (each [DataRow] is one) times the average seconds per case.
+// the .trx files under [timings dir] (earlier runs, averaged over the runs that ran it, because one
+// run's timings carry its runners' speed), or, where those files don't cover it, its number of
+// cases (each [DataRow] is one) times the average seconds per case.
 //
 // Whole classes are the unit, except a class bigger than half a lane's share, which is split into
 // its methods so one slow class doesn't set the run's length. A method's data rows stay together.
@@ -172,13 +173,15 @@ static string FullName(MetadataReader md, TypeDefinition type)
     return ns.Length > 0 ? ns + "." + name : name;
 }
 
-// (class, method) -> total seconds, and (class, null) -> the class's total, from every .trx file
-// under the directory.
+// (class, method) -> seconds, and (class, null) -> the class's total, from the .trx files under the
+// directory. Each file is one lane of one run, so a test appears in one file per run that ran it;
+// a test's duration is its average over those runs, and a class's is the sum of its methods'.
 static Dictionary<(string Class, string? Method), double> ReadTimings(string? dir)
 {
-    var result = new Dictionary<(string, string?), double>();
+    var sums = new Dictionary<(string, string?), double>();
+    var runs = new Dictionary<(string, string?), int>();
     if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir))
-        return result;
+        return sums;
 
     XNamespace t = "http://microsoft.com/schemas/VisualStudio/TeamTest/2010";
     foreach (var file in Directory.EnumerateFiles(dir, "*.trx", SearchOption.AllDirectories))
@@ -187,6 +190,7 @@ static Dictionary<(string Class, string? Method), double> ReadTimings(string? di
         var testOf = doc.Descendants(t + "UnitTest").ToDictionary(
             u => (string?)u.Attribute("id") ?? "",
             u => u.Element(t + "TestMethod"));
+        var seen = new HashSet<(string, string?)>();
         foreach (var r in doc.Descendants(t + "UnitTestResult"))
         {
             if (!testOf.TryGetValue((string?)r.Attribute("testId") ?? "", out var test)
@@ -194,9 +198,18 @@ static Dictionary<(string Class, string? Method), double> ReadTimings(string? di
                 || (string?)test.Attribute("name") is not { } method
                 || !TimeSpan.TryParse((string?)r.Attribute("duration"), out var duration))
                 continue;
-            result[(cls, method)] = result.GetValueOrDefault((cls, method)) + duration.TotalSeconds;
-            result[(cls, null)] = result.GetValueOrDefault((cls, null)) + duration.TotalSeconds;
+            sums[(cls, method)] = sums.GetValueOrDefault((cls, method)) + duration.TotalSeconds;
+            if (seen.Add((cls, method)))
+                runs[(cls, method)] = runs.GetValueOrDefault((cls, method)) + 1;
         }
+    }
+
+    var result = new Dictionary<(string Class, string? Method), double>();
+    foreach (var (key, seconds) in sums)
+    {
+        var average = seconds / runs[key];
+        result[key] = average;
+        result[(key.Item1, null)] = result.GetValueOrDefault((key.Item1, null)) + average;
     }
 
     return result;
