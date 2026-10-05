@@ -17,8 +17,8 @@ concurrency:
 env:
   # The suite runs in RUNNERS x LANES test processes: LANES processes side by side on each of
   # RUNNERS runners (see .github/scripts/TestShards.cs).
-  RUNNERS: 8
-  LANES: 2
+  RUNNERS: 6
+  LANES: 3
   DOTNET_NOLOGO: true
   DOTNET_CLI_TELEMETRY_OPTOUT: true
 
